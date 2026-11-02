@@ -44,6 +44,7 @@ import zlib
 from collections import Counter
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 
 ENV_FILE = Path.home() / ".config/call-transcript/.env"
@@ -68,7 +69,17 @@ def setting(name: str, default: str = "") -> str:
     return os.environ.get(name, "").strip() or FILE_ENV.get(name, "") or default
 
 
-ENDPOINT = os.environ.get("CALL_TRANSCRIPT_GROQ_URL") or "https://api.groq.com/openai/v1/audio/transcriptions"
+def safe_endpoint(name: str, url: str) -> str:
+    """Подмена адреса - только для проверок: ключ уходит в заголовке, поэтому не на чужой http."""
+    parts = urlsplit(url)
+    if (parts.scheme == "https" and parts.hostname) or (
+            parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost", "::1")):
+        return url
+    raise SystemExit(f"{name}: только https:// или http://127.0.0.1")
+
+
+ENDPOINT = safe_endpoint("CALL_TRANSCRIPT_GROQ_URL", os.environ.get("CALL_TRANSCRIPT_GROQ_URL")
+                         or "https://api.groq.com/openai/v1/audio/transcriptions")
 MODEL = "whisper-large-v3"
 # auto - Groq, при сбое локально; groq - только Groq; local - только локально.
 ENGINE = setting("CALL_TRANSCRIPT_ENGINE", "auto")
@@ -86,10 +97,8 @@ LOCAL_PROMPTS = {
 LANG_NAMES = {"ru": "Russian", "uk": "Ukrainian", "en": "English", "be": "Belarusian", "pl": "Polish",
               "de": "German", "es": "Spanish", "fr": "French", "it": "Italian", "pt": "Portuguese"}
 GROQ_PAUSE_FILE = "groq_pause.json"
-SONIOX_API = os.environ.get("CALL_TRANSCRIPT_SONIOX_URL") or "https://api.soniox.com/v1"
-# Подмена адреса - только для проверок: ключ уходит в заголовке, поэтому не на чужой http.
-if not SONIOX_API.startswith(("https://", "http://127.0.0.1")):
-    raise SystemExit("CALL_TRANSCRIPT_SONIOX_URL: только https:// или http://127.0.0.1")
+SONIOX_API = safe_endpoint("CALL_TRANSCRIPT_SONIOX_URL",
+                           os.environ.get("CALL_TRANSCRIPT_SONIOX_URL") or "https://api.soniox.com/v1")
 SONIOX_MODEL = "stt-async-v5"
 # Подсказка словами: имена и жаргон, которые Whisper путал (references/mishearings.md).
 # Свои слова навсегда - в CALL_TRANSCRIPT_TERMS через запятую, на одну запись - --terms.
@@ -377,8 +386,21 @@ def cmd_prepare(a: argparse.Namespace) -> None:
     if shutil.which("ffmpeg") is None:
         raise SystemExit("нет ffmpeg: brew install ffmpeg (Linux: sudo apt install ffmpeg)")
     media, work = Path(a.media).resolve(), Path(a.work)
+    if not media.is_file():
+        raise SystemExit(f"нет файла {media}")
+    size = media.stat().st_size
     work.mkdir(parents=True, exist_ok=True)
-    audio = work / "audio.mp3"
+    audio, meta_path = work / "audio.mp3", work / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    except ValueError:
+        meta = {}
+    # Кеш Groq и Soniox, сегменты и правки в папке относятся к той записи, с которой её начали.
+    if meta and (meta.get("media") != str(media) or meta.get("size", size) != size):
+        raise SystemExit(f"рабочая папка {work} уже занята другой записью ({Path(str(meta.get('media'))).name}). "
+                         "Для этой записи возьми другую папку, например с « (2)» в имени")
+    if audio.exists() and not meta:
+        audio.unlink()  # прошлый prepare оборвался раньше, чем записал, из какой записи звук
     streams = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
                               "-of", "csv=p=0", str(media)], capture_output=True, text=True).stdout.split()
     if not streams:
@@ -389,9 +411,14 @@ def cmd_prepare(a: argparse.Namespace) -> None:
             # Без смешивания ffmpeg возьмёт одну дорожку, и голос с другой пропадёт целиком.
             labels = "".join(f"[0:a:{i}]" for i in range(len(streams)))
             mix = ["-filter_complex", f"{labels}amix=inputs={len(streams)}:duration=longest[a]", "-map", "[a]"]
+        # Целиком или никак: оборванный ffmpeg не должен оставить полу-звук под итоговым именем.
+        part = work / "audio.part.mp3"
         ffmpeg("-i", str(media), *mix, "-vn", "-acodec", "libmp3lame", "-ar", "16000", "-ac", "1", "-b:a", "64k",
-               str(audio))
+               str(part))
+        part.replace(audio)
     total = duration(audio)
+    meta_path.write_text(json.dumps({"media": str(media), "size": size, "duration": total,
+                                     "audio_streams": len(streams)}, ensure_ascii=False), encoding="utf-8")
 
     log = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio), "-af",
                           "silencedetect=noise=-40dB:d=0.8", "-f", "null", "-"], capture_output=True, text=True).stderr
@@ -414,8 +441,6 @@ def cmd_prepare(a: argparse.Namespace) -> None:
         cut(audio, chunks / f"chunk_{i:03d}.mp3", s, e - s)
         lines.append(f"{i}\t{s:.3f}\t{e - s:.3f}\n")
     (work / "chunks.tsv").write_text("".join(lines))
-    (work / "meta.json").write_text(json.dumps({"media": str(media), "duration": total, "audio_streams": len(streams)},
-                                               ensure_ascii=False))
 
     print(f"длительность {stamp(total)}, кусков {len(lines)}, звуковых дорожек {len(streams)}")
     if len(streams) > 1:
@@ -431,17 +456,24 @@ def cmd_langs(a: argparse.Namespace) -> None:
     out = work / "langs"
     out.mkdir(exist_ok=True)
     counts = Counter()
-    for start in range(int(a.first), int(total - a.length), a.every):
-        if silence_share(silences, start, start + a.length) > 0.5:
+    starts, length = list(range(int(a.first), int(total - a.length), a.every)), a.length
+    if not starts:
+        # Запись короче отступа и одного окна: одно окно с начала.
+        starts, length = [0], min(a.length, total)
+    for start in starts:
+        if silence_share(silences, start, start + length) > 0.5:
             continue
         clip = out / f"w_{start:05d}.mp3"
         if not clip.exists():
-            cut(work / "audio.mp3", clip, start, a.length)
+            cut(work / "audio.mp3", clip, start, length)
         data = cached_whisper(key, clip, clip.with_suffix(".json"), None, work)
         lang = str(data.get("language"))
         counts[lang] += 1
         text = " ".join(s["text"].strip() for s in data.get("segments") or [])
         print(f"{stamp(start)} {lang}{local_mark(data)}: {text[:100]}")
+    if not counts:
+        print("итого: окон с речью не нашлось. Язык определи отрывком: clip --langs auto")
+        return
     print("итого:", ", ".join(f"{lang} {n}" for lang, n in counts.most_common()))
 
 
@@ -633,21 +665,45 @@ def soniox_delete(key: str, kind: str, ident: str) -> bool:
     return False
 
 
-def soniox_find(key: str, ref: str) -> list[tuple[str, str]]:
-    """Файлы и транскрипции с нашей меткой: так находятся те, чей ответ потерялся."""
-    found = []
-    for kind in ("transcriptions", "files"):
+def soniox_list(key: str, kind: str) -> list[dict] | None:
+    """Весь список kind у Soniox по страницам. None - прочитать целиком не удалось."""
+    items: list[dict] = []
+    cursor = None
+    for _page in range(100):
+        path = f"/{kind}?limit=1000" + (f"&cursor={quote(str(cursor), safe='')}" if cursor else "")
         try:
-            status, data = soniox_request(key, "GET", f"/{kind}")
+            status, data = soniox_request(key, "GET", path)
         except Exception as exc:  # noqa: BLE001
             print(f"ВНИМАНИЕ: не удалось проверить список {kind} у Soniox ({type(exc).__name__})")
-            continue
-        items = data.get(kind) if status < 400 else None
-        if not isinstance(items, list):
+            return None
+        page = data.get(kind) if status < 400 else None
+        if not isinstance(page, list):
             print(f"ВНИМАНИЕ: не удалось проверить список {kind} у Soniox (код {status})")
+            return None
+        items += [i for i in page if isinstance(i, dict)]
+        cursor = data.get("next_page_cursor")
+        if not cursor:
+            return items
+    print(f"ВНИМАНИЕ: список {kind} у Soniox длиннее 100 страниц, проверен не целиком")
+    return None
+
+
+def soniox_find(key: str, ref: str) -> tuple[list[tuple[str, str]], bool]:
+    """Файлы и транскрипции этого запуска: так находятся те, чей ответ потерялся.
+
+    Узнаём по метке или по имени файла: имя загрузки - та же метка, а есть ли метка в
+    списке файлов, документация Soniox не обещает. Второе значение - оба списка
+    прочитаны целиком; иначе «ничего не нашлось» ничего не доказывает.
+    """
+    found, complete = [], True
+    for kind in ("transcriptions", "files"):
+        items = soniox_list(key, kind)
+        if items is None:
+            complete = False
             continue
-        found += [(kind, str(i["id"])) for i in items if isinstance(i, dict) and i.get("client_reference_id") == ref]
-    return found
+        found += [(kind, str(i["id"])) for i in items
+                  if i.get("id") and (i.get("client_reference_id") == ref or i.get("filename") == f"{ref}.mp3")]
+    return found, complete
 
 
 def soniox_forget(key: str, ids: dict) -> bool:
@@ -662,9 +718,12 @@ def soniox_forget(key: str, ids: dict) -> bool:
         signal.signal(sig, signal.SIG_IGN)
     try:
         targets = [("transcriptions", ids.get("transcription_id")), ("files", ids.get("file_id"))]
+        ok = False
         if ids.get("ref"):
-            targets += [t for t in soniox_find(key, ids["ref"]) if t not in targets]
-        ok = True
+            found, ok = soniox_find(key, str(ids["ref"]))
+            targets += [t for t in found if t not in targets]
+        else:
+            print("ВНИМАНИЕ: нет метки запуска, проверить Soniox до конца нельзя")
         for kind, ident in targets:
             if ident:
                 ok = soniox_delete(key, kind, str(ident)) and ok
@@ -683,7 +742,10 @@ def soniox_transcribe(key: str, audio: Path, langs: list[str], terms: list[str],
     ids = {"ref": f"call-transcript-{uuid.uuid4().hex}", "file_id": None, "transcription_id": None}
 
     def remember() -> None:
-        pending.write_text(json.dumps(ids), encoding="utf-8")
+        # Целиком или никак: испорченный pending потерял бы номера того, что надо удалить.
+        part = pending.with_suffix(".part")
+        part.write_text(json.dumps(ids), encoding="utf-8")
+        part.replace(pending)
 
     remember()
     started = time.time()
@@ -691,7 +753,7 @@ def soniox_transcribe(key: str, audio: Path, langs: list[str], terms: list[str],
         boundary = f"----call{uuid.uuid4().hex}"
         body = (f'--{boundary}\r\nContent-Disposition: form-data; name="client_reference_id"\r\n\r\n'
                 f'{ids["ref"]}\r\n'
-                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{audio.name}"\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{ids["ref"]}.mp3"\r\n'
                 f"Content-Type: audio/mpeg\r\n\r\n").encode() + audio.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
         ids["file_id"] = soniox_ok(*soniox_call(key, "POST", "/files", body=body, timeout=600,
                                                 content_type=f"multipart/form-data; boundary={boundary}"),
@@ -795,10 +857,17 @@ def cmd_soniox(a: argparse.Namespace) -> None:
         try:
             ids = json.loads(pending.read_text(encoding="utf-8"))
         except ValueError:
-            ids = {}
-        if soniox_forget(key, ids if isinstance(ids, dict) else {}):
-            pending.unlink(missing_ok=True)
+            ids = None
+        if not isinstance(ids, dict) or not soniox_forget(key, ids):
+            # Новая загрузка перезаписала бы pending, и номера неубранного потерялись бы.
+            raise SystemExit("ВНИМАНИЕ: у Soniox может остаться звук прошлого запуска, новую загрузку не начинаю. "
+                             f"Запусти команду ещё раз позже. Если не поможет, проверь console.soniox.com, "
+                             f"удали там файлы и транскрипции этой записи, потом удали {pending}")
+        pending.unlink(missing_ok=True)
     if not cache.exists():
+        if ENGINE == "local":
+            raise SystemExit("CALL_TRANSCRIPT_ENGINE=local: звук не уходит из компьютера, быстрый режим через "
+                             "Soniox выключен. Сделай обычный режим")
         extra = f"{setting('CALL_TRANSCRIPT_TERMS')},{a.terms or ''}"
         terms = list(dict.fromkeys(SONIOX_TERMS + [t.strip() for t in extra.split(",") if t.strip()]))
         transcript = soniox_transcribe(key or load_soniox_key(), audio, a.langs.split(","), terms, pending)
@@ -900,6 +969,8 @@ def cmd_assemble(a: argparse.Namespace) -> None:
     splits = {int(n): (marker, who) for n, marker, who in edits.get("split", [])}
     if 1 not in turns:
         raise SystemExit("turns должен называть говорящего с сегмента 1")
+    for n in list(turns) + list(splits):
+        seg(n)
     for who in list(turns.values()) + [who for _, who in splits.values()]:
         if speakers and who not in speakers:
             raise SystemExit(f"«{who}» нет в speakers {speakers}")
