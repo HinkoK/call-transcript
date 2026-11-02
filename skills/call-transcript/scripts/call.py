@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import io
 import json
@@ -382,13 +383,22 @@ def read_rows(work: Path, tag: str) -> list[dict]:
     return rows
 
 
+def fingerprint(path: Path) -> str:
+    """sha256 содержимого: путь и размер не отличают перезаписанный файл того же размера."""
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def cmd_prepare(a: argparse.Namespace) -> None:
     if shutil.which("ffmpeg") is None:
         raise SystemExit("нет ffmpeg: brew install ffmpeg (Linux: sudo apt install ffmpeg)")
     media, work = Path(a.media).resolve(), Path(a.work)
     if not media.is_file():
         raise SystemExit(f"нет файла {media}")
-    size = media.stat().st_size
+    size, digest = media.stat().st_size, fingerprint(media)
     work.mkdir(parents=True, exist_ok=True)
     audio, meta_path = work / "audio.mp3", work / "meta.json"
     try:
@@ -396,8 +406,14 @@ def cmd_prepare(a: argparse.Namespace) -> None:
     except ValueError:
         meta = {}
     # Кеш Groq и Soniox, сегменты и правки в папке относятся к той записи, с которой её начали.
-    if meta and (meta.get("media") != str(media) or meta.get("size", size) != size):
-        raise SystemExit(f"рабочая папка {work} уже занята другой записью ({Path(str(meta.get('media'))).name}). "
+    # Та же запись узнаётся по содержимому, даже если её переименовали или перенесли.
+    if meta.get("sha256"):
+        same = meta["sha256"] == digest
+    else:
+        same = not meta or (meta.get("media") == str(media) and meta.get("size", size) == size)
+    if not same:
+        raise SystemExit(f"рабочая папка {work} уже занята другой записью или запись изменилась "
+                         f"(была {Path(str(meta.get('media'))).name}). "
                          "Для этой записи возьми другую папку, например с « (2)» в имени")
     if audio.exists() and not meta:
         audio.unlink()  # прошлый prepare оборвался раньше, чем записал, из какой записи звук
@@ -417,7 +433,7 @@ def cmd_prepare(a: argparse.Namespace) -> None:
                str(part))
         part.replace(audio)
     total = duration(audio)
-    meta_path.write_text(json.dumps({"media": str(media), "size": size, "duration": total,
+    meta_path.write_text(json.dumps({"media": str(media), "size": size, "sha256": digest, "duration": total,
                                      "audio_streams": len(streams)}, ensure_ascii=False), encoding="utf-8")
 
     log = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio), "-af",
@@ -733,11 +749,15 @@ def soniox_forget(key: str, ids: dict) -> bool:
             signal.signal(sig, handler)
 
 
-def soniox_transcribe(key: str, audio: Path, langs: list[str], terms: list[str], pending: Path) -> dict:
-    """Загрузить звук, распознать с говорящими, забрать текст. У Soniox ничего не остаётся.
+def soniox_transcribe(key: str, audio: Path, langs: list[str], terms: list[str], pending: Path,
+                      cache: Path) -> dict:
+    """Загрузить звук, распознать с говорящими, сохранить текст в cache. У Soniox ничего не остаётся.
 
     До загрузки в pending пишется метка запуска, потом номера файла и задания: если процесс
-    убьют наглухо, следующий запуск по ним уберёт всё у Soniox.
+    убьют наглухо, следующий запуск по ним уберёт всё у Soniox. Текст ложится на диск до
+    удаления у Soniox: оборвись процесс между ними, следующий запуск возьмёт кеш и только
+    доубирает. Если диск текст не принял, у Soniox всё равно удаляем: приватность важнее,
+    распознавание придётся повторить.
     """
     ids = {"ref": f"call-transcript-{uuid.uuid4().hex}", "file_id": None, "transcription_id": None}
 
@@ -782,6 +802,14 @@ def soniox_transcribe(key: str, audio: Path, langs: list[str], terms: list[str],
         transcript = soniox_ok(*soniox_request(key, "GET", f"/transcriptions/{ids['transcription_id']}/transcript",
                                                timeout=300), "текст")
         print(f"Soniox: загрузка {uploaded - started:.0f} с, распознавание {time.time() - uploaded:.0f} с")
+        # Целиком или никак: оборванная запись не должна стать «кешем».
+        part = cache.with_suffix(".part")
+        try:
+            part.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+            part.replace(cache)
+        except OSError as exc:
+            raise SystemExit(f"Soniox: текст получен, но не записался на диск ({exc}). У Soniox всё равно "
+                             "удаляю: распознавание придётся повторить") from None
         return transcript
     except NET_ERRORS as exc:
         raise SystemExit(f"Soniox: сеть: {type(exc).__name__}: {exc}") from None
@@ -870,11 +898,7 @@ def cmd_soniox(a: argparse.Namespace) -> None:
                              "Soniox выключен. Сделай обычный режим")
         extra = f"{setting('CALL_TRANSCRIPT_TERMS')},{a.terms or ''}"
         terms = list(dict.fromkeys(SONIOX_TERMS + [t.strip() for t in extra.split(",") if t.strip()]))
-        transcript = soniox_transcribe(key or load_soniox_key(), audio, a.langs.split(","), terms, pending)
-        # Целиком или никак: оборванная запись не должна стать «кешем».
-        part = cache.with_suffix(".part")
-        part.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
-        part.replace(cache)
+        soniox_transcribe(key or load_soniox_key(), audio, a.langs.split(","), terms, pending, cache)
     tokens = json.loads(cache.read_text(encoding="utf-8")).get("tokens") or []
     segs = soniox_segments(tokens)
     if not segs:
